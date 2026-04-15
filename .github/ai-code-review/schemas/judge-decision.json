@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "required": ["decision", "reasoning", "policy_rules_applied"],
+  "additionalProperties": false,
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["auto_approve_eligible", "needs_human_review"],
+      "description": "The approval decision"
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "Detailed explanation of why this decision was made, referencing specific reviewer concerns and policy rules"
+    },
+    "policy_rules_applied": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of specific merge policy rules that were evaluated"
+    }
+  }
+}

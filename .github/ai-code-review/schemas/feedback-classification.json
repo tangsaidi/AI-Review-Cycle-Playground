@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "required": ["reasoning", "classification"],
+  "additionalProperties": false,
+  "properties": {
+    "reasoning": {
+      "type": "string",
+      "description": "Chain-of-thought analysis of what happened with this PR"
+    },
+    "classification": {
+      "type": "string",
+      "enum": ["agreement", "soft_override", "hard_override", "false_negative"],
+      "description": "How the judge's decision compared to the actual outcome"
+    }
+  }
+}

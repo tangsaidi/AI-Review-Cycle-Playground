@@ -1,0 +1,182 @@
+name: Weekly Policy Review
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 9:00 AM UTC
+  workflow_dispatch:
+
+jobs:
+  policy-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: policy-review
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download recent feedback artifacts
+        id: download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p /tmp/feedback-artifacts
+
+          # Compute 7-day cutoff date (GNU date and BSD date compatible)
+          CUTOFF_DATE=$(date -u -d '7 days ago' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                        date -u -v-7d +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Artifact prefix must match upload name in review-feedback.yml
+          gh api "repos/$REPO/actions/artifacts" \
+            --paginate \
+            --jq ".artifacts[] | select(.name | startswith(\"review-feedback-pr-\")) | select(.created_at >= \"${CUTOFF_DATE}\") | .id" \
+            > /tmp/artifact-ids.txt
+
+          ARTIFACT_COUNT=$(awk 'END{print NR}' /tmp/artifact-ids.txt)
+          echo "artifact_count=${ARTIFACT_COUNT}" >> $GITHUB_OUTPUT
+
+          if [ "$ARTIFACT_COUNT" -eq 0 ]; then
+            echo "No feedback artifacts found in the last 7 days."
+            exit 0
+          fi
+
+          # Download each artifact and extract feedback.json
+          while IFS= read -r artifact_id; do
+            gh api "repos/$REPO/actions/artifacts/${artifact_id}/zip" \
+              > "/tmp/artifact-${artifact_id}.zip" 2>/dev/null || true
+            unzip -q -o "/tmp/artifact-${artifact_id}.zip" \
+              -d "/tmp/feedback-artifacts/${artifact_id}/" 2>/dev/null || true
+            rm -f "/tmp/artifact-${artifact_id}.zip"
+          done < /tmp/artifact-ids.txt
+
+          # Merge all feedback JSON files into a single array
+          find /tmp/feedback-artifacts -name "feedback.json" -exec cat {} \; | \
+            jq -s '.' > /tmp/all-feedback.json
+
+          MERGED_COUNT=$(jq 'length' /tmp/all-feedback.json)
+          echo "Downloaded and merged ${MERGED_COUNT} feedback records from ${ARTIFACT_COUNT} artifacts."
+
+      - name: Skip if insufficient data
+        if: fromJSON(steps.download.outputs.artifact_count) < 3
+        env:
+          ARTIFACT_COUNT: ${{ steps.download.outputs.artifact_count }}
+        run: |
+          {
+            printf '## Weekly Policy Review\n\n'
+            printf 'Skipped: fewer than 3 feedback data points in the last 7 days.\n'
+            printf 'Artifact count: %s\n' "$ARTIFACT_COUNT"
+            printf '\nThe policy review will run automatically once enough feedback has accumulated.\n'
+          } >> $GITHUB_STEP_SUMMARY
+          exit 0
+
+      - name: Read current policy
+        if: fromJSON(steps.download.outputs.artifact_count) >= 3
+        id: current-policy
+        run: |
+          EOF_MARKER=$(openssl rand -hex 8)
+          echo "content<<${EOF_MARKER}" >> $GITHUB_OUTPUT
+          cat .github/ai-code-review/MERGE_POLICY.md >> $GITHUB_OUTPUT
+          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
+
+      - name: Read feedback summary
+        if: fromJSON(steps.download.outputs.artifact_count) >= 3
+        id: feedback-summary
+        run: |
+          EOF_MARKER=$(openssl rand -hex 8)
+          echo "data<<${EOF_MARKER}" >> $GITHUB_OUTPUT
+          cat /tmp/all-feedback.json >> $GITHUB_OUTPUT
+          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
+
+      - name: AI policy analysis
+        if: fromJSON(steps.download.outputs.artifact_count) >= 3
+        id: policy-analysis
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are reviewing the performance of an AI code review system for the postscript-marketing-ai repository and suggesting improvements to its merge policy.
+
+            ## Current Merge Policy
+
+            ${{ steps.current-policy.outputs.content }}
+
+            ## Feedback Data (Last 7 Days)
+
+            The following JSON array contains outcome data for every PR reviewed by the AI judge in the last 7 days:
+
+            ```json
+            ${{ steps.feedback-summary.outputs.data }}
+            ```
+
+            ## Classification Definitions
+
+            - **agreement**: Judge was correct
+            - **soft_override**: Judge approved but human left substantive comments (judge slightly too lenient)
+            - **hard_override**: Judge approved but human rejected (judge was wrong -- most important signal)
+            - **false_negative**: Judge held for human review but human merged without review (judge too conservative)
+
+            ## Your Task
+
+            1. Analyze the feedback data. What patterns do you see? What is the hard_override rate? What categories or risk levels are associated with overrides?
+
+            2. Identify specific policy changes that would reduce hard overrides and false negatives. Be conservative -- prefer adding new "always requires human review" categories over expanding the safe list.
+
+            3. If changes are warranted, edit .github/ai-code-review/MERGE_POLICY.md directly. Increment the policy version number. Add a "## Revision Notes" section at the bottom explaining what changed and why, citing specific feedback data patterns.
+
+            4. If the current policy is already well-calibrated (low hard_override rate, few false negatives), do not make changes. Instead, add a comment to the PR body explaining the data looks healthy.
+
+            Err on the side of caution. The goal is accuracy, not throughput.
+          claude_args: >-
+            --max-turns 5
+            --max-budget-usd 1.00
+            --allowedTools "Edit,Read,Bash(git diff:*)"
+
+      - name: Check policy analysis result
+        if: fromJSON(steps.download.outputs.artifact_count) >= 3 && steps.policy-analysis.outcome == 'failure'
+        run: |
+          echo "::warning::AI policy analysis step failed. No policy changes will be suggested this week."
+          echo "## Weekly Policy Review" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "AI policy analysis failed. Check the 'AI policy analysis' step logs for details." >> $GITHUB_STEP_SUMMARY
+
+      - name: Open draft PR if policy changed
+        if: fromJSON(steps.download.outputs.artifact_count) >= 3 && steps.policy-analysis.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Check if the AI analysis modified MERGE_POLICY.md
+          if git diff --quiet -- .github/ai-code-review/MERGE_POLICY.md; then
+            echo "No policy changes suggested. Exiting."
+            echo "::notice::Policy review complete. No changes suggested."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          REVIEW_DATE=$(date +"%Y-%m-%d")
+          BRANCH="auto/policy-review-$(date +"%Y%m%dT%H%M")"
+          git switch -c "$BRANCH"
+          git add .github/ai-code-review/MERGE_POLICY.md
+          git commit -m "chore(policy): weekly policy review ${REVIEW_DATE}"
+          git push --set-upstream origin "$BRANCH"
+
+          CUTOFF=$(date -u -d '7 days ago' +"%Y-%m-%d" 2>/dev/null || date -u -v-7d +"%Y-%m-%d")
+          gh pr create \
+            --title "Weekly Policy Review ${REVIEW_DATE}: Suggested MERGE_POLICY.md changes" \
+            --body "Automated policy review based on ${CUTOFF} - ${REVIEW_DATE} feedback data. Review the suggested changes and merge if they look correct. This PR was created by policy-review.yml." \
+            --base main \
+            --head "$BRANCH" \
+            --draft

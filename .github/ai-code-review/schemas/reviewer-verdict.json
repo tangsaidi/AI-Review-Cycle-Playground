@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "required": ["risk_level", "categories", "concerns", "summary", "review_confidence"],
+  "additionalProperties": false,
+  "properties": {
+    "risk_level": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Overall risk assessment of the PR"
+    },
+    "categories": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "prompt_change",
+          "ai_generation_logic",
+          "celery_task",
+          "database_model",
+          "api_endpoint",
+          "configuration",
+          "dependency_update",
+          "test_only",
+          "documentation",
+          "infrastructure",
+          "refactor",
+          "bug_fix",
+          "new_feature"
+        ]
+      },
+      "description": "Categories of changes in this PR"
+    },
+    "concerns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "description", "severity"],
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "File path where the concern exists"
+          },
+          "description": {
+            "type": "string",
+            "description": "Concise description of the concern"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["nitpick", "suggestion", "warning", "blocking"],
+            "description": "How serious this concern is"
+          }
+        }
+      },
+      "description": "Specific concerns found during review"
+    },
+    "summary": {
+      "type": "string",
+      "description": "2-3 sentence summary of the PR and overall assessment"
+    },
+    "review_confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "How confident the reviewer is in its assessment"
+    }
+  }
+}

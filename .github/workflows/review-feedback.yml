@@ -1,0 +1,313 @@
+name: Review Feedback Loop
+
+on:
+  # workflow_dispatch is included (commented out) for initial testing.
+  #
+  # workflow_dispatch:
+  #   inputs:
+  #     pr_number:
+  #       description: 'PR number to test feedback on'
+  #       required: true
+  pull_request:
+    types: [closed]
+
+jobs:
+  # Label contracts:
+  #   Consumes: auto-approve-eligible, needs-human-review
+  capture-feedback:
+    # Only run on PRs that were reviewed by the AI judge (have either label)
+    if: |
+      contains(github.event.pull_request.labels.*.name, 'auto-approve-eligible') ||
+      contains(github.event.pull_request.labels.*.name, 'needs-human-review')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: review-feedback-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Determine judge label
+        id: label
+        env:
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          if echo "$LABELS_JSON" | jq -e 'index("auto-approve-eligible")' > /dev/null 2>&1; then
+            echo "judge_decision=auto_approve_eligible" >> $GITHUB_OUTPUT
+          elif echo "$LABELS_JSON" | jq -e 'index("needs-human-review")' > /dev/null 2>&1; then
+            echo "judge_decision=needs_human_review" >> $GITHUB_OUTPUT
+          else
+            echo "judge_decision=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine PR outcome
+        id: outcome
+        env:
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+        run: |
+          if [ "$PR_MERGED" = "true" ]; then
+            echo "action=merged" >> $GITHUB_OUTPUT
+          else
+            echo "action=closed_without_merge" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Gather context
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Gather rich context for the AI reasoning step
+          PR_DATA=$(gh pr view "$PR_NUMBER" --json reviews,comments,labels,title,mergedAt,closedAt 2>&1 || echo "{}")
+
+          EOF_MARKER=$(openssl rand -hex 8)
+          echo "pr_data<<${EOF_MARKER}" >> $GITHUB_OUTPUT
+          echo "$PR_DATA" >> $GITHUB_OUTPUT
+          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
+
+          # Extract human review activity count for deterministic fallback
+          JUDGE_COMMENT_TIME=$(echo "$PR_DATA" | jq -r \
+            '[.comments[] | select(.body | contains("AI Judge Decision")) | .createdAt] | last // empty')
+
+          if [ -z "$JUDGE_COMMENT_TIME" ]; then
+            echo "review_count=0" >> $GITHUB_OUTPUT
+            echo "changes_requested=0" >> $GITHUB_OUTPUT
+            echo "human_reviewed=unknown" >> $GITHUB_OUTPUT
+          else
+            HUMAN_REVIEWS=$(echo "$PR_DATA" | jq --arg cutoff "$JUDGE_COMMENT_TIME" \
+              '[.reviews[] | select(.submittedAt > $cutoff and (.author.login | contains("[bot]") | not))] | length')
+            HUMAN_COMMENTS=$(echo "$PR_DATA" | jq --arg cutoff "$JUDGE_COMMENT_TIME" \
+              '[.comments[] | select(.createdAt > $cutoff and (.author.login | contains("[bot]") | not) and (.body | contains("AI Judge Decision") | not))] | length')
+            TOTAL=$((HUMAN_REVIEWS + HUMAN_COMMENTS))
+            echo "review_count=${TOTAL}" >> $GITHUB_OUTPUT
+
+            CHANGES=$(echo "$PR_DATA" | jq --arg cutoff "$JUDGE_COMMENT_TIME" \
+              '[.reviews[] | select(.state == "CHANGES_REQUESTED" and .submittedAt > $cutoff)] | length')
+            echo "changes_requested=${CHANGES}" >> $GITHUB_OUTPUT
+
+            if [ "$TOTAL" -gt 0 ]; then
+              echo "human_reviewed=true" >> $GITHUB_OUTPUT
+            else
+              echo "human_reviewed=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Read classification schema
+        id: classify-schema
+        run: |
+          SCHEMA=$(jq -c . .github/ai-code-review/schemas/feedback-classification.json)
+          echo "json=${SCHEMA}" >> $GITHUB_OUTPUT
+
+      # AI reasoning step: generates chain-of-thought before classification.
+      # This is the primary classification path (Shopper Supervisor pattern).
+      # The deterministic shell fallback in "Classify feedback" only runs if
+      # this step fails or produces an unusable result.
+      # continue-on-error: true ensures the workflow does not fail if the AI
+      # step hits the budget cap or encounters an API error.
+      - name: AI reasoning about outcome
+        id: ai-classify
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are analyzing the outcome of an AI-reviewed pull request to classify what happened.
+
+            ## Context
+
+            Judge decision: ${{ steps.label.outputs.judge_decision }}
+            PR outcome: ${{ steps.outcome.outputs.action }}
+            Human review activity: ${{ steps.context.outputs.review_count }} interactions after judge decision
+            Changes requested: ${{ steps.context.outputs.changes_requested }}
+
+            ## PR Data
+
+            ```json
+            ${{ steps.context.outputs.pr_data }}
+            ```
+
+            ## Classification Categories
+
+            - **agreement**: The judge's assessment matched the human outcome. Either the judge said auto-approve and the PR was merged without friction, or the judge said needs-human-review and a human reviewed before merging.
+            - **soft_override**: The judge said auto-approve-eligible, but a human left substantive review comments before merging. The judge was slightly too lenient but the final outcome was still a merge.
+            - **hard_override**: The judge said auto-approve-eligible, but a human requested changes OR the PR was closed without merging. The judge was wrong.
+            - **false_negative**: The judge said needs-human-review, but the PR was merged quickly without any human review activity. The judge was too conservative.
+
+            ## Your Task
+
+            First, reason carefully about what happened: What did the judge decide? What did humans do? Does the sequence of events suggest the judge was right or wrong?
+
+            Then output a JSON object with:
+            - "reasoning": your chain-of-thought analysis (2-4 sentences)
+            - "classification": one of the four categories above
+          # --allowedTools "" intentionally disables all tools; this step only needs text reasoning
+          claude_args: >-
+            --max-turns 1
+            --max-budget-usd 0.25
+            --allowedTools ""
+            --json-schema '${{ steps.classify-schema.outputs.json }}'
+
+      - name: Classify feedback
+        id: classify
+        env:
+          AI_OUTPUT: ${{ steps.ai-classify.outputs.structured_output }}
+          JUDGE: ${{ steps.label.outputs.judge_decision }}
+          ACTION: ${{ steps.outcome.outputs.action }}
+          HUMAN_REVIEWED: ${{ steps.context.outputs.human_reviewed }}
+          CHANGES_REQUESTED: ${{ steps.context.outputs.changes_requested }}
+        run: |
+          # Try to use the AI classification first
+          if [ -n "$AI_OUTPUT" ]; then
+            AI_CLASSIFICATION=$(echo "$AI_OUTPUT" | jq -r '.classification // empty' 2>/dev/null)
+            AI_REASONING=$(echo "$AI_OUTPUT" | jq -r '.reasoning // empty' 2>/dev/null)
+          fi
+
+          # Validate AI classification against allowed enum values
+          if [ -n "$AI_CLASSIFICATION" ] && [ "$AI_CLASSIFICATION" != "null" ]; then
+            case "$AI_CLASSIFICATION" in
+              agreement|soft_override|hard_override|false_negative) ;;
+              *) AI_CLASSIFICATION="" ;;  # invalid value — force deterministic fallback
+            esac
+          fi
+
+          if [ -n "$AI_CLASSIFICATION" ] && [ "$AI_CLASSIFICATION" != "null" ]; then
+            echo "classification=${AI_CLASSIFICATION}" >> $GITHUB_OUTPUT
+            echo "classification_source=ai" >> $GITHUB_OUTPUT
+            EOF_MARKER=$(openssl rand -hex 8)
+            echo "ai_reasoning<<${EOF_MARKER}" >> $GITHUB_OUTPUT
+            echo "$AI_REASONING" >> $GITHUB_OUTPUT
+            echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Deterministic fallback if AI step failed or returned empty
+          echo "classification_source=deterministic" >> $GITHUB_OUTPUT
+          echo "ai_reasoning=" >> $GITHUB_OUTPUT
+          echo "::warning::AI classification step failed; using deterministic fallback."
+
+          if [ "$HUMAN_REVIEWED" = "unknown" ]; then
+            # Cannot determine human review activity — don't guess
+            CLASSIFICATION="unknown"
+          elif [ "$JUDGE" = "auto_approve_eligible" ]; then
+            if [ "$ACTION" = "closed_without_merge" ]; then
+              CLASSIFICATION="hard_override"
+            elif [ "${CHANGES_REQUESTED:-0}" -gt 0 ] 2>/dev/null; then
+              CLASSIFICATION="hard_override"
+            elif [ "$HUMAN_REVIEWED" = "true" ]; then
+              CLASSIFICATION="soft_override"
+            else
+              CLASSIFICATION="agreement"
+            fi
+          elif [ "$JUDGE" = "needs_human_review" ]; then
+            if [ "$ACTION" = "merged" ] && [ "$HUMAN_REVIEWED" = "false" ]; then
+              CLASSIFICATION="false_negative"
+            else
+              CLASSIFICATION="agreement"
+            fi
+          else
+            CLASSIFICATION="unknown"
+          fi
+
+          echo "classification=${CLASSIFICATION}" >> $GITHUB_OUTPUT
+
+      - name: Log feedback data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLASSIFICATION: ${{ steps.classify.outputs.classification }}
+          CLASSIFICATION_SOURCE: ${{ steps.classify.outputs.classification_source }}
+          AI_REASONING: ${{ steps.classify.outputs.ai_reasoning }}
+          JUDGE: ${{ steps.label.outputs.judge_decision }}
+          ACTION: ${{ steps.outcome.outputs.action }}
+          REVIEW_COUNT: ${{ steps.context.outputs.review_count }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Write step summary via temp file to avoid heredoc injection.
+          # PR_TITLE comes from env: (safe from ${{ }} injection) but may
+          # contain shell-special characters. printf to a temp file avoids
+          # unquoted heredoc expansion issues.
+          {
+            printf '## Review Feedback: #%s\n\n' "${PR_NUMBER}"
+            printf '| Field | Value |\n'
+            printf '|-------|-------|\n'
+            printf '| PR | #%s - %s |\n' "${PR_NUMBER}" "${PR_TITLE}"
+            printf '| Judge decision | %s |\n' "${JUDGE}"
+            printf '| Actual outcome | %s |\n' "${ACTION}"
+            printf '| Human review activity | %s interactions |\n' "${REVIEW_COUNT}"
+            printf '| **Classification** | **%s** |\n' "${CLASSIFICATION}"
+            printf '| Classification source | %s |\n' "${CLASSIFICATION_SOURCE}"
+            printf '| Timestamp | %s |\n' "${TIMESTAMP}"
+          } > /tmp/summary.md
+
+          cat /tmp/summary.md >> $GITHUB_STEP_SUMMARY
+
+          # Write structured JSON artifact using jq to safely construct the
+          # object (no risk of injection through PR_TITLE or other fields)
+          jq -n \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg pr_title "$PR_TITLE" \
+            --arg judge_decision "$JUDGE" \
+            --arg actual_outcome "$ACTION" \
+            --argjson human_review_count "${REVIEW_COUNT:-0}" \
+            --arg classification "$CLASSIFICATION" \
+            --arg classification_source "$CLASSIFICATION_SOURCE" \
+            --arg ai_reasoning "$AI_REASONING" \
+            --arg timestamp "$TIMESTAMP" \
+            '{
+              pr_number: $pr_number,
+              pr_title: $pr_title,
+              judge_decision: $judge_decision,
+              actual_outcome: $actual_outcome,
+              human_review_count: $human_review_count,
+              classification: $classification,
+              classification_source: $classification_source,
+              ai_reasoning: $ai_reasoning,
+              timestamp: $timestamp
+            }' > /tmp/feedback.json
+
+          echo "Feedback classification: ${CLASSIFICATION} (source: ${CLASSIFICATION_SOURCE})"
+
+      - name: Upload feedback artifact
+        if: steps.classify.outputs.classification != 'unknown'
+        uses: actions/upload-artifact@v4
+        with:
+          # Artifact name prefix must match policy-review.yml's download filter
+          name: review-feedback-pr-${{ github.event.pull_request.number }}
+          path: /tmp/feedback.json
+          retention-days: 90
+
+      - name: Alert on hard override
+        if: steps.classify.outputs.classification == 'hard_override'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          {
+            printf '## :rotating_light: Hard Override Detected\n\n'
+            printf 'The AI judge labeled this PR as **auto-approve-eligible**, but a human reviewer '
+            printf 'disagreed (requested changes or closed without merging).\n\n'
+            printf '**This means the judge was wrong.** Investigate:\n'
+            printf '1. What did the judge miss?\n'
+            printf '2. Should the merge policy (.github/ai-code-review/MERGE_POLICY.md) be updated?\n'
+            printf '3. Should the reviewer prompt (.github/ai-code-review/prompts/reviewer.md) be improved?\n\n'
+            printf '**PR:** #%s - %s\n' "${PR_NUMBER}" "${PR_TITLE}"
+            printf '**URL:** %s\n' "${PR_URL}"
+          } > /tmp/alert-comment.md
+
+          gh pr comment "$PR_NUMBER" --body-file /tmp/alert-comment.md
+
+          echo "::warning::HARD OVERRIDE on PR #${PR_NUMBER}: Judge said auto-approve-eligible but human disagreed."
