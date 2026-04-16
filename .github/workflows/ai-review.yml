@@ -39,7 +39,7 @@ jobs:
           fetch-depth: 1
 
       # Read the reviewer prompt from file and store as a step output.
-      # GitHub Actions `with` blocks only support ${{ }} expressions,
+      # GitHub Actions `with` blocks only support expression syntax,
       # NOT shell expansion like $(cat ...). We use a random-delimiter
       # heredoc to safely pass multiline content to GITHUB_OUTPUT.
       - name: Read reviewer prompt
@@ -84,13 +84,12 @@ jobs:
             --allowedTools "Bash(gh:*),mcp__github"
             --json-schema '${{ steps.reviewer-schema.outputs.json }}'
 
-      # NOTE on single-quote wrapping of ${{ }} in claude_args:
+      # NOTE on single-quote wrapping in claude_args:
       # The >- block scalar folds to a single string. GitHub Actions
-      # interpolates ${{ }} before YAML parsing, so the single quotes
+      # interpolates expressions before YAML parsing, so the single quotes
       # become literal characters: --json-schema '{"type":...}'.
       # Whether the CLI accepts this depends on its argument parser.
-      # Validate during initial deployment. If it fails, remove the quotes:
-      #   --json-schema ${{ steps.reviewer-schema.outputs.json }}
+      # Validate during initial deployment. If it fails, remove the quotes.
 
       - name: Check reviewer output
         id: check-reviewer
@@ -160,7 +159,7 @@ jobs:
 
       # All `run` blocks below use env: variables for untrusted inputs
       # (PR title, structured output JSON) to prevent script injection.
-      # Never interpolate ${{ }} directly in `run:` for user-controlled values.
+      # Never interpolate expressions directly in `run:` for user-controlled values.
       - name: Parse judge decision
         id: parse
         env:
@@ -231,7 +230,7 @@ jobs:
           fi
 
           # Build comment body to a temp file to avoid heredoc injection.
-          # Variables come from env: (safe from ${{ }} injection), but PR
+          # Variables come from env: (safe from expression injection), but PR
           # titles may contain shell-special characters. printf avoids
           # unquoted heredoc expansion.
           {
