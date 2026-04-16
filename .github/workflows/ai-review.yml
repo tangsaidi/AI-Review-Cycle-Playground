@@ -5,261 +5,28 @@ on:
     types: [opened, labeled, synchronize]
 
 jobs:
-  # Label contracts:
-  #   Produces: auto-approve-eligible, needs-human-review
-  #   Consumes: ready-for-review
   ai-review:
-    if: >-
-      github.event_name == 'pull_request' &&
-      contains(github.event.pull_request.labels.*.name, 'ready-for-review')
+    if: contains(github.event.pull_request.labels.*.name, 'ready-for-review')
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    concurrency:
-      group: ai-review-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
     permissions:
       contents: read
       pull-requests: write
-      issues: write
-      id-token: write
 
     steps:
-      - name: Debug event info
+      - name: Debug
         run: |
-          echo "Event: ${{ github.event_name }}"
-          echo "Action: ${{ github.event.action }}"
-          echo "Labels: ${{ toJSON(github.event.pull_request.labels.*.name) }}"
+          echo "AI Review workflow triggered"
+          echo "PR: ${{ github.event.pull_request.number }}"
 
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # Read the reviewer prompt from file and store as a step output.
-      # GitHub Actions `with` blocks only support ${{ }} expressions,
-      # NOT shell expansion like $(cat ...). We use a random-delimiter
-      # heredoc to safely pass multiline content to GITHUB_OUTPUT.
-      - name: Read reviewer prompt
-        id: prompt
-        run: |
-          EOF_MARKER=$(openssl rand -hex 8)
-          echo "content<<${EOF_MARKER}" >> $GITHUB_OUTPUT
-          cat .github/ai-code-review/prompts/reviewer.md >> $GITHUB_OUTPUT
-          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
-
-      # Read JSON schemas from files so they are not inlined as fragile
-      # single-line strings in claude_args. jq -c . compacts to one line.
-      - name: Read reviewer schema
-        id: reviewer-schema
-        run: |
-          SCHEMA=$(jq -c . .github/ai-code-review/schemas/reviewer-verdict.json)
-          echo "json=${SCHEMA}" >> $GITHUB_OUTPUT
-
-      - name: Read judge schema
-        id: judge-schema
-        run: |
-          SCHEMA=$(jq -c . .github/ai-code-review/schemas/judge-decision.json)
-          echo "json=${SCHEMA}" >> $GITHUB_OUTPUT
-
-      - name: Read merge policy
-        id: read-policy
-        run: |
-          EOF_MARKER=$(openssl rand -hex 8)
-          echo "policy<<${EOF_MARKER}" >> $GITHUB_OUTPUT
-          cat .github/ai-code-review/MERGE_POLICY.md >> $GITHUB_OUTPUT
-          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
-
-      - name: AI Reviewer
-        id: review
+      - name: Test claude-code-action
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: ${{ steps.prompt.outputs.content }}
-          claude_args: >-
-            --max-turns 10
-            --max-budget-usd 2.00
-            --allowedTools "Bash(gh:*),mcp__github"
-            --json-schema '${{ steps.reviewer-schema.outputs.json }}'
-
-      # NOTE on single-quote wrapping of ${{ }} in claude_args:
-      # The >- block scalar folds to a single string. GitHub Actions
-      # interpolates ${{ }} before YAML parsing, so the single quotes
-      # become literal characters: --json-schema '{"type":...}'.
-      # Whether the CLI accepts this depends on its argument parser.
-      # Validate during initial deployment. If it fails, remove the quotes:
-      #   --json-schema ${{ steps.reviewer-schema.outputs.json }}
-
-      - name: Check reviewer output
-        id: check-reviewer
-        env:
-          REVIEWER_OUTPUT: ${{ steps.review.outputs.structured_output }}
-        run: |
-          if [ -z "$REVIEWER_OUTPUT" ]; then
-            echo "::warning::AI Reviewer produced no structured output (budget exceeded or API error). Defaulting to needs_human_review."
-            echo "empty=true" >> $GITHUB_OUTPUT
-          else
-            echo "empty=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Get CI status
-        id: ci-status
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          CI_STATUS=$(gh pr checks "$PR_NUMBER" --repo "$REPO" 2>&1 || echo "CI checks not available yet")
-          EOF_MARKER=$(openssl rand -hex 8)
-          echo "status<<${EOF_MARKER}" >> $GITHUB_OUTPUT
-          echo "$CI_STATUS" >> $GITHUB_OUTPUT
-          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
-
-      - name: Read judge prompt
-        id: judge-prompt
-        run: |
-          EOF_MARKER=$(openssl rand -hex 8)
-          echo "content<<${EOF_MARKER}" >> $GITHUB_OUTPUT
-          cat .github/ai-code-review/prompts/judge.md >> $GITHUB_OUTPUT
-          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
-
-      # The judge reads the reviewer's structured_output directly from
-      # the step output. No artifact passing, no PR context loss.
-      # Trusted step outputs are safe to interpolate into `with` blocks.
-      - name: AI Judge
-        if: steps.check-reviewer.outputs.empty == 'false'
-        id: judge
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: |
-            ${{ steps.judge-prompt.outputs.content }}
-
-            ## Reviewer's Structured Verdict
-
-            ```json
-            ${{ steps.review.outputs.structured_output }}
-            ```
-
-            ## Merge Policy
-
-            ${{ steps.read-policy.outputs.policy }}
-
-            ## CI Status
-
-            ```
-            ${{ steps.ci-status.outputs.status }}
-            ```
-          claude_args: >-
-            --max-turns 3
-            --max-budget-usd 0.50
-            --allowedTools "Bash(gh pr checks:*)"
-            --json-schema '${{ steps.judge-schema.outputs.json }}'
-
-      # All `run` blocks below use env: variables for untrusted inputs
-      # (PR title, structured output JSON) to prevent script injection.
-      # Never interpolate ${{ }} directly in `run:` for user-controlled values.
-      - name: Parse judge decision
-        id: parse
-        env:
-          JUDGE_OUTPUT: ${{ steps.judge.outputs.structured_output }}
-        run: |
-          if [ -z "$JUDGE_OUTPUT" ]; then
-            echo "::warning::Judge step produced no output (budget exceeded, API error, or reviewer output was empty)."
-            echo "decision=needs_human_review" >> $GITHUB_OUTPUT
-            echo "reasoning=Judge step produced no output" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          DECISION=$(echo "$JUDGE_OUTPUT" | jq -r '.decision')
-          if [ "$DECISION" = "null" ] || [ -z "$DECISION" ]; then
-            echo "::warning::Judge output did not contain a valid decision. Defaulting to needs_human_review."
-            echo "decision=needs_human_review" >> $GITHUB_OUTPUT
-            echo "reasoning=Judge output was malformed or missing decision field" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          REASONING=$(echo "$JUDGE_OUTPUT" | jq -r '.reasoning')
-          echo "decision=${DECISION}" >> $GITHUB_OUTPUT
-          EOF_MARKER=$(openssl rand -hex 8)
-          echo "reasoning<<${EOF_MARKER}" >> $GITHUB_OUTPUT
-          echo "$REASONING" >> $GITHUB_OUTPUT
-          echo "${EOF_MARKER}" >> $GITHUB_OUTPUT
-
-      - name: Remove stale labels
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gh pr edit "$PR_NUMBER" \
-            --remove-label "auto-approve-eligible" \
-            --remove-label "needs-human-review" \
-            2>/dev/null || true
-
-      - name: Apply decision label
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          DECISION: ${{ steps.parse.outputs.decision }}
-        run: |
-          if [ "$DECISION" = "auto_approve_eligible" ]; then
-            LABEL="auto-approve-eligible"
-          else
-            LABEL="needs-human-review"
-          fi
-          gh pr edit "$PR_NUMBER" --add-label "$LABEL"
-
-      - name: Post judge decision comment
-        if: steps.check-reviewer.outputs.empty == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          DECISION: ${{ steps.parse.outputs.decision }}
-          REASONING: ${{ steps.parse.outputs.reasoning }}
-          REVIEWER_OUTPUT: ${{ steps.review.outputs.structured_output }}
-        run: |
-          REVIEWER_RISK=$(echo "$REVIEWER_OUTPUT" | jq -r '.risk_level')
-          REVIEWER_CONFIDENCE=$(echo "$REVIEWER_OUTPUT" | jq -r '.review_confidence')
-          CONCERN_COUNT=$(echo "$REVIEWER_OUTPUT" | jq '.concerns | length')
-
-          if [ "$DECISION" = "auto_approve_eligible" ]; then
-            ICON=":white_check_mark:"
-            LABEL_TEXT="Auto-approve eligible"
-          else
-            ICON=":eyes:"
-            LABEL_TEXT="Needs human review"
-          fi
-
-          # Build comment body to a temp file to avoid heredoc injection.
-          # Variables come from env: (safe from ${{ }} injection), but PR
-          # titles may contain shell-special characters. printf avoids
-          # unquoted heredoc expansion.
-          {
-            printf '%s AI Judge Decision: %s\n\n' "## ${ICON}" "${LABEL_TEXT}"
-            printf '**Reviewer assessment:** risk=%s, confidence=%s, concerns=%s\n\n' \
-              "${REVIEWER_RISK}" "${REVIEWER_CONFIDENCE}" "${CONCERN_COUNT}"
-            printf '**Judge reasoning:**\n%s\n\n' "${REASONING}"
-            printf -- '---\n'
-            printf '<sub>This is an automated assessment. Human review is still required before merging.</sub>\n'
-          } > /tmp/judge-comment.md
-
-          gh pr comment "$PR_NUMBER" --body-file /tmp/judge-comment.md
-          cat /tmp/judge-comment.md >> $GITHUB_STEP_SUMMARY
-
-      - name: Approve PR if auto-approve eligible
-        if: steps.parse.outputs.decision == 'auto_approve_eligible'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          gh pr review "$PR_NUMBER" --approve \
-            --body "Auto-approved by AI Judge. Human review is still required before merging (branch protection enforces this)."
-
-      # Future graduation path: uncomment when feedback data shows >95% accuracy
-      # AND automated DB migrations are in place. The judge moves from approving
-      # to auto-merging. This requires a separate implementation effort.
-      #
-      # - name: Enable auto-merge (FUTURE GRADUATION -- do not uncomment without sign-off)
-      #   if: steps.parse.outputs.decision == 'auto_approve_eligible'
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #     PR_NUMBER: ${{ github.event.pull_request.number }}
-      #   run: |
-      #     gh pr merge "$PR_NUMBER" --auto --squash
+          prompt: "Say hello and confirm you can see this PR."
+          claude_args: "--max-turns 1 --max-budget-usd 0.10"
