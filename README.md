@@ -26,3 +26,5 @@ Test environment for the AI code review system from postscript-marketing-ai PR #
 ## Testing
 
 This repo is used for end-to-end testing of the AI review pipeline before deploying to production.
+
+See PR history for test runs.
