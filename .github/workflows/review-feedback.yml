@@ -20,7 +20,7 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'auto-approve-eligible') ||
       contains(github.event.pull_request.labels.*.name, 'needs-human-review')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     concurrency:
       group: review-feedback-${{ github.event.pull_request.number }}
       cancel-in-progress: false
@@ -150,11 +150,10 @@ jobs:
             Then output a JSON object with:
             - "reasoning": your chain-of-thought analysis (2-4 sentences)
             - "classification": one of the four categories above
-          # --allowedTools "" intentionally disables all tools; this step only needs text reasoning
+          # This step only needs text reasoning, no tools
           claude_args: >-
             --max-turns 1
             --max-budget-usd 0.25
-            --allowedTools ""
             --json-schema '${{ steps.classify-schema.outputs.json }}'
 
       - name: Classify feedback
