@@ -235,7 +235,7 @@ jobs:
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           # Write step summary via temp file to avoid heredoc injection.
-          # PR_TITLE comes from env: (safe from ${{ }} injection) but may
+          # PR_TITLE comes from env: (safe from expression injection) but may
           # contain shell-special characters. printf to a temp file avoids
           # unquoted heredoc expansion issues.
           {
