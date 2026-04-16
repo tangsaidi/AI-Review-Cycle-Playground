@@ -22,3 +22,7 @@ Test environment for the AI code review system from postscript-marketing-ai PR #
 2. Enable "Allow GitHub Actions to create and approve pull requests" in Actions settings
 3. Create the three labels listed above
 4. Apply `ready-for-review` label to a PR to trigger the AI review pipeline
+
+## Testing
+
+This repo is used for end-to-end testing of the AI review pipeline before deploying to production.
