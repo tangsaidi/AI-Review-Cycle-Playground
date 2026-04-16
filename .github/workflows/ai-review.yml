@@ -9,8 +9,9 @@ jobs:
   #   Produces: auto-approve-eligible, needs-human-review
   #   Consumes: ready-for-review
   ai-review:
-    # Only run when the ready-for-review label is present
-    if: contains(github.event.pull_request.labels.*.name, 'ready-for-review')
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'ready-for-review')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -23,6 +24,12 @@ jobs:
       id-token: write
 
     steps:
+      - name: Debug event info
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Action: ${{ github.event.action }}"
+          echo "Labels: ${{ toJSON(github.event.pull_request.labels.*.name) }}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
